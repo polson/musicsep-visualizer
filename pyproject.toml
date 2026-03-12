@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "musicsep-visualizer"
+version = "0.1.0"
+description = "CUDA/OpenGL tensor visualizer extracted from MusicSep-Lightning"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.8.0",
+  "cuda-python",
+  "pygame>=2.6.1",
+  "PyOpenGL>=3.1.10",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
