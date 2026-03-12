@@ -337,12 +337,81 @@ class TensorVisualizer:
         self.current_channel = 0  # State for channel cycling
         self._should_exit = False
         self.sidebar = Sidebar()
+        self._stft_window_cache = {}
+        self._stft_n_fft = 1024
+        self._stft_hop_length = 256
+        self._stft_win_length = 1024
+        self._stft_center = True
         
         # Stats
         self.current_min = 0.0
         self.current_max = 0.0
         self.current_mean = 0.0
         self.current_std = 0.0
+
+    def _is_waveform_tensor_2d(self, tensor: torch.Tensor) -> bool:
+        if tensor.dim() != 2:
+            return False
+
+        h, w = tensor.shape
+        long_enough = 1024
+
+        return ((h in (1, 2) and w >= long_enough) or
+                (w in (1, 2) and h >= long_enough))
+
+    def _get_stft_window(self, win_length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        cache_key = (win_length, str(device), dtype)
+        window = self._stft_window_cache.get(cache_key)
+        if window is None:
+            window = torch.hann_window(
+                win_length,
+                periodic=True,
+                device=device,
+                dtype=dtype,
+            )
+            self._stft_window_cache[cache_key] = window
+        return window
+
+    def _waveform_to_spectrogram(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        try:
+            if tensor.dim() != 2:
+                return None
+
+            if not torch.is_floating_point(tensor):
+                tensor = tensor.float()
+
+            if not tensor.is_cuda:
+                tensor = tensor.cuda(non_blocking=True)
+
+            # Normalize to [channels, samples]
+            if tensor.shape[0] not in (1, 2) and tensor.shape[1] in (1, 2):
+                tensor = tensor.transpose(0, 1)
+
+            if tensor.shape[0] not in (1, 2):
+                return None
+
+            tensor = tensor.contiguous()
+            window = self._get_stft_window(self._stft_win_length, tensor.device, tensor.dtype)
+
+            stft = torch.stft(
+                tensor,
+                n_fft=self._stft_n_fft,
+                hop_length=self._stft_hop_length,
+                win_length=self._stft_win_length,
+                window=window,
+                center=self._stft_center,
+                return_complex=True,
+            )
+            spec_mag = stft.abs()
+
+            if spec_mag.numel() == 0 or not torch.isfinite(spec_mag).all():
+                return None
+
+            return spec_mag
+        except Exception as e:
+            if Config.DEBUG_MODE:
+                print(f"[Vis] STFT conversion failed: {e}")
+            return None
 
     def _signal_handler(self, signum, frame):
         """Handle termination signals gracefully."""
@@ -481,6 +550,12 @@ class TensorVisualizer:
 
                         if tensor is not None:
                             if tensor.dim() == 4: tensor = tensor[0]
+
+                            if self._is_waveform_tensor_2d(tensor):
+                                spectrogram = self._waveform_to_spectrogram(tensor)
+                                if spectrogram is None:
+                                    continue
+                                tensor = spectrogram
 
                             if tensor.dim() == 3:
                                 num_channels = tensor.shape[0]
