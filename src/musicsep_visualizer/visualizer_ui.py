@@ -1,5 +1,6 @@
 import pygame
 from OpenGL.GL import *
+from typing import Optional
 
 class Sidebar:
     def __init__(self, width_px=250, bg_color=(20, 20, 25), text_color=(220, 220, 220)):
@@ -16,6 +17,8 @@ class Sidebar:
         self.hook_names = []
         self.active_index = 0
         self.item_rects = [] # List of (rect, index)
+        self.show_play_button = False
+        self.play_button_rect: Optional[pygame.Rect] = None
         
         # Cache for window size to detect resizes
         self.last_win_size = (0, 0)
@@ -63,15 +66,27 @@ class Sidebar:
             self.active_index = active_index
             self._needs_update = True
 
+    def set_play_button_visible(self, visible: bool):
+        if self.show_play_button != visible:
+            self.show_play_button = visible
+            self._needs_update = True
+
     def handle_click(self, x, y):
         """
-        Check if a click at (x, y) hit any list item.
-        Returns the index of the clicked item, or None.
+        Check if a click at (x, y) hit any interactive sidebar element.
+        Returns:
+            ("play_waveform", None) if play button was clicked
+            ("select_hook", index) if a hook list item was clicked
+            None for no hit
         """
         # x, y are local to the sidebar surface (0,0 at top-left)
+        if self.play_button_rect and self.play_button_rect.collidepoint(x, y):
+            return ("play_waveform", None)
+
         for rect, idx in self.item_rects:
             if rect.collidepoint(x, y):
-                return idx
+                return ("select_hook", idx)
+
         return None
 
     def _update_surface_and_texture(self, win_w, win_h):
@@ -83,6 +98,7 @@ class Sidebar:
         if self._needs_update:
             self.surface.fill(self.bg_color)
             self.item_rects = []
+            self.play_button_rect = None
             
             # Simple text rendering
             # Split lines if it's a multiline string
@@ -99,7 +115,19 @@ class Sidebar:
                 text_surf = self.font.render(line, True, self.text_color)
                 self.surface.blit(text_surf, (x_offset, y_offset))
                 y_offset += 20
-            
+
+            if self.show_play_button:
+                y_offset += 12
+                button_h = 34
+                button_rect = pygame.Rect(15, y_offset, self.width_px - 30, button_h)
+                pygame.draw.rect(self.surface, (50, 88, 120), button_rect, border_radius=6)
+                pygame.draw.rect(self.surface, (98, 148, 194), button_rect, width=1, border_radius=6)
+                button_label = self.font.render("Play Waveform", True, (240, 245, 250))
+                label_rect = button_label.get_rect(center=button_rect.center)
+                self.surface.blit(button_label, label_rect)
+                self.play_button_rect = button_rect
+                y_offset += button_h
+
             # Draw Hook List
             y_offset += 20
             list_title = self.font.render("Tensors (Click to select)", True, (255, 200, 100))
@@ -130,7 +158,7 @@ class Sidebar:
                 
             # Upload to texture
             # "RGB" format, flip=True (1) because OpenGL is bottom-left origin
-            data = pygame.image.tostring(self.surface, "RGB", 1)
+            data = pygame.image.tostring(self.surface, "RGB", True)
             
             glBindTexture(GL_TEXTURE_2D, self.texture)
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1)

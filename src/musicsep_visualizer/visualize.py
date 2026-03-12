@@ -17,6 +17,7 @@ from pygame.locals import *
 
 from .stft import STFT
 from .visualizer_ui import Sidebar
+from .waveform_playback import WaveformPlaybackHandler
 
 # =============================================================================
 # Exception Hook for Crash Cleanup
@@ -343,6 +344,7 @@ class TensorVisualizer:
         self._stft_win_length = 2048
         self._stft_center = True
         self._stft_converter: Optional[STFT] = None
+        self._waveform_playback = WaveformPlaybackHandler(sample_rate=44_100, debug_mode=Config.DEBUG_MODE)
         
         # Stats
         self.current_min = 0.0
@@ -537,20 +539,25 @@ class TensorVisualizer:
                         if tensor is not None:
                             if tensor.dim() == 4: tensor = tensor[0]
 
+                            self._waveform_playback.update_from_tensor(tensor)
+
                             if self._is_waveform_tensor_2d(tensor):
                                 spectrogram = self._waveform_to_spectrogram(tensor)
                                 if spectrogram is None:
-                                    continue
-                                tensor = spectrogram
+                                    tensor = None
+                                else:
+                                    tensor = spectrogram
 
-                            if tensor.dim() == 3:
+                            if tensor is not None and tensor.dim() == 3:
                                 num_channels = tensor.shape[0]
                                 channel_idx_used = self.current_channel % num_channels
                                 tensor = tensor[channel_idx_used]
 
-                            if tensor.dim() == 2:
+                            if tensor is not None and tensor.dim() == 2:
                                 tensor = self._downsample_tensor(tensor)
                                 self._render_tensor(tensor, sidebar_width)
+                        else:
+                            self._waveform_playback.update_from_tensor(None)
                     except Exception as e:
                         # Log but don't crash - just skip this frame
                         print(f"[Vis] Frame error (skipping): {e}")
@@ -571,6 +578,7 @@ class TensorVisualizer:
                     status_str += f"Ch: {channel_idx_used}"
                     self.sidebar.update_content(status_str)
                     self.sidebar.set_hooks(self.known_names, self.active_hook_index)
+                    self.sidebar.set_play_button_visible(self._waveform_playback.is_play_available)
 
                     # Pygame Caption (Keep minimal or remove since we have sidebar)
                     pygame.display.set_caption(f"Visualizer | {active_name}")
@@ -589,6 +597,8 @@ class TensorVisualizer:
                 import traceback
                 traceback.print_exc()
         finally:
+            self._waveform_playback.cleanup()
+
             # Clean up CUDA-GL interop resources before pygame
             self._cleanup_gl()
             
@@ -773,11 +783,17 @@ class TensorVisualizer:
                 if event.button == 1: # Left Click
                     x, y = event.pos
                     if x < self.sidebar.width_px:
-                        new_idx = self.sidebar.handle_click(x, y)
-                        if new_idx is not None and new_idx < len(self.known_names):
-                            self.active_hook_index = new_idx
+                        action = self.sidebar.handle_click(x, y)
+                        if action is None:
+                            continue
+
+                        action_type, action_value = action
+                        if action_type == "select_hook" and action_value is not None and action_value < len(self.known_names):
+                            self.active_hook_index = action_value
                             self.ring.set_active_hook(self.known_names[self.active_hook_index])
                             self.current_channel = 0
+                        if action_type == "play_waveform":
+                            self._waveform_playback.play_cached_waveform()
             if event.type == KEYDOWN:
                 if event.key == K_ESCAPE: return False
                 if event.key == K_c: self.current_channel += 1

@@ -74,6 +74,7 @@ Inside the visualizer window:
 - `[ / ]`: decrease/increase `db_min`
 - `- / =`: decrease/increase `db_max`
 - `R`: resize window to current tensor dimensions
+- Sidebar `Play Waveform` button: plays currently viewed waveform once at 44.1 kHz
 - `Esc` or window close: exit visualizer
 
 ## API
