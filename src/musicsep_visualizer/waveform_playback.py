@@ -1,4 +1,5 @@
 import array
+import time
 from typing import Optional
 
 import pygame
@@ -14,10 +15,32 @@ class WaveformPlaybackHandler:
         self._audio_init_failed = False
         self._current_sound = None
         self._current_channel_obj = None
+        self._playback_started_at: Optional[float] = None
+        self._playback_duration_seconds = 0.0
+        self._played_waveform_num_samples: Optional[int] = None
 
     @property
     def is_play_available(self) -> bool:
         return self._latest_waveform is not None
+
+    @property
+    def is_playing(self) -> bool:
+        if self._current_channel_obj is None:
+            return False
+
+        try:
+            if not self._current_channel_obj.get_busy():
+                self._clear_playback_state()
+                return False
+        except Exception:
+            self._clear_playback_state()
+            return False
+
+        if self._playback_progress() >= 1.0:
+            self._clear_playback_state()
+            return False
+
+        return True
 
     @staticmethod
     def _is_waveform_tensor_2d(tensor: torch.Tensor) -> bool:
@@ -52,6 +75,29 @@ class WaveformPlaybackHandler:
 
         self._latest_waveform = self._extract_waveform_for_playback(tensor)
 
+    def _clear_playback_state(self) -> None:
+        self._playback_started_at = None
+        self._playback_duration_seconds = 0.0
+        self._played_waveform_num_samples = None
+
+    def _playback_progress(self) -> float:
+        if self._playback_started_at is None or self._playback_duration_seconds <= 0.0:
+            return 0.0
+
+        elapsed = time.perf_counter() - self._playback_started_at
+        return max(0.0, min(1.0, elapsed / self._playback_duration_seconds))
+
+    def get_playback_progress(self) -> Optional[float]:
+        if not self.is_playing:
+            return None
+        return self._playback_progress()
+
+    def should_draw_scan_line(self) -> bool:
+        if not self.is_playing or self._latest_waveform is None:
+            return False
+
+        return self._latest_waveform.shape[-1] == self._played_waveform_num_samples
+
     def _ensure_audio_initialized(self) -> bool:
         if self._audio_ready:
             return True
@@ -65,23 +111,17 @@ class WaveformPlaybackHandler:
                 )
             self._audio_ready = True
             return True
-        except Exception as e:
-            if self.debug_mode and not self._audio_init_failed:
-                print(f"[Vis] Audio init failed: {e}")
+        except Exception:
             self._audio_init_failed = True
             self._audio_ready = False
             return False
 
     def play_cached_waveform(self) -> None:
         if self._latest_waveform is None:
-            print("[Vis] play_cached_waveform: No waveform available")
             return
 
         if not self._ensure_audio_initialized():
-            print("[Vis] play_cached_waveform: Audio init failed")
             return
-
-        print(f"[Vis] play_cached_waveform: Playing waveform with shape {self._latest_waveform.shape}")
 
         waveform = self._latest_waveform
         try:
@@ -106,12 +146,19 @@ class WaveformPlaybackHandler:
 
             if self._current_channel_obj is not None and self._current_channel_obj.get_busy():
                 self._current_channel_obj.stop()
+            self._clear_playback_state()
 
             self._current_sound = pygame.mixer.Sound(buffer=pcm_bytes)
             self._current_channel_obj = self._current_sound.play()
-        except Exception as e:
-            if self.debug_mode:
-                print(f"[Vis] Audio playback failed: {e}")
+            if self._current_channel_obj is None:
+                self._clear_playback_state()
+                return
+
+            self._playback_started_at = time.perf_counter()
+            self._playback_duration_seconds = waveform.shape[-1] / float(self.sample_rate)
+            self._played_waveform_num_samples = waveform.shape[-1]
+        except Exception:
+            self._clear_playback_state()
 
     def cleanup(self) -> None:
         try:
@@ -123,6 +170,7 @@ class WaveformPlaybackHandler:
         self._current_channel_obj = None
         self._current_sound = None
         self._latest_waveform = None
+        self._clear_playback_state()
 
         try:
             if pygame.mixer.get_init() is not None:

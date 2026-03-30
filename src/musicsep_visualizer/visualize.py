@@ -479,6 +479,7 @@ class TensorVisualizer:
         self._stft_center = True
         self._stft_converter: Optional[STFT] = None
         self._waveform_playback = WaveformPlaybackHandler(sample_rate=44_100, debug_mode=Config.DEBUG_MODE)
+        self._last_tensor_viewport = None
         
         # Stats
         self.current_min = 0.0
@@ -678,6 +679,7 @@ class TensorVisualizer:
                     
                     # Draw Sidebar first
                     sidebar_width = self.sidebar.draw(self.display_size)
+                    self._last_tensor_viewport = None
                     
                     channel_idx_used = 0
                     num_channels = 0
@@ -722,6 +724,7 @@ class TensorVisualizer:
                                 tensor = tensor.cuda(non_blocking=True)
                             tensor = self._downsample_tensor(tensor)
                             self._render_tensor(tensor, sidebar_width)
+                            self._draw_playback_scan_line()
                         else:
                             self.current_shape = None
                     except Exception as e:
@@ -830,6 +833,7 @@ class TensorVisualizer:
         
         # Absolute x
         abs_x = offset_x + rel_x
+        self._last_tensor_viewport = (abs_x, rel_y, dw, dh)
         
         # Convert to NDC [-1, 1]
         x1 = 2 * abs_x / win_w - 1
@@ -857,6 +861,34 @@ class TensorVisualizer:
         glTexCoord2f(0, v_max);
         glVertex2f(x1, y1)
         glEnd()
+
+    def _draw_playback_scan_line(self):
+        if not self._waveform_playback.should_draw_scan_line():
+            return
+
+        progress = self._waveform_playback.get_playback_progress()
+        if progress is None or self._last_tensor_viewport is None:
+            return
+
+        abs_x, abs_y, width, height = self._last_tensor_viewport
+        if width <= 0 or height <= 0:
+            return
+
+        line_x = abs_x + (width * progress)
+        win_w, win_h = self.display_size
+
+        x_ndc = 2 * line_x / win_w - 1
+        y_top = 1 - 2 * abs_y / win_h
+        y_bottom = 1 - 2 * (abs_y + height) / win_h
+
+        glDisable(GL_TEXTURE_2D)
+        glLineWidth(2.0)
+        glColor3f(0.2, 0.95, 1.0)
+        glBegin(GL_LINES)
+        glVertex2f(x_ndc, y_bottom)
+        glVertex2f(x_ndc, y_top)
+        glEnd()
+        glEnable(GL_TEXTURE_2D)
 
     def _cuda_copy_to_pbo(self, pixels):
         if not self.cuda_res or not self.gl_ready:
@@ -959,7 +991,6 @@ class TensorVisualizer:
                             self.ring.set_active_hook(self.known_names[self.active_hook_index])
                             self.current_channel = 0
                         if action_type == "play_waveform":
-                            print("[Vis] Play button clicked")
                             self._waveform_playback.play_cached_waveform()
             if event.type == KEYDOWN:
                 if event.key == K_ESCAPE: return False
