@@ -362,6 +362,23 @@ class TensorVisualizer:
         return ((h in (1, 2) and w >= long_enough) or
                 (w in (1, 2) and h >= long_enough))
 
+    def _extract_waveform_for_playback(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        if tensor.dim() == 2:
+            if self._is_waveform_tensor_2d(tensor):
+                return tensor
+            return None
+
+        if tensor.dim() == 3:
+            c, h, w = tensor.shape
+            long_enough = 1024
+
+            if c == 1 and h in (1, 2) and w >= long_enough:
+                return tensor.squeeze(0)
+            if c == 1 and w in (1, 2) and h >= long_enough:
+                return tensor.squeeze(0).transpose(0, 1)
+
+        return None
+
     def _waveform_to_spectrogram(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
         try:
             if tensor.dim() != 2:
@@ -539,7 +556,8 @@ class TensorVisualizer:
                         if tensor is not None:
                             if tensor.dim() == 4: tensor = tensor[0]
 
-                            self._waveform_playback.update_from_tensor(tensor)
+                            waveform_for_playback = self._extract_waveform_for_playback(tensor)
+                            self._waveform_playback.update_from_tensor(waveform_for_playback)
 
                             if self._is_waveform_tensor_2d(tensor):
                                 spectrogram = self._waveform_to_spectrogram(tensor)
@@ -793,6 +811,7 @@ class TensorVisualizer:
                             self.ring.set_active_hook(self.known_names[self.active_hook_index])
                             self.current_channel = 0
                         if action_type == "play_waveform":
+                            print("[Vis] Play button clicked")
                             self._waveform_playback.play_cached_waveform()
             if event.type == KEYDOWN:
                 if event.key == K_ESCAPE: return False

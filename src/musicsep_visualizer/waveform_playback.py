@@ -74,10 +74,14 @@ class WaveformPlaybackHandler:
 
     def play_cached_waveform(self) -> None:
         if self._latest_waveform is None:
+            print("[Vis] play_cached_waveform: No waveform available")
             return
 
         if not self._ensure_audio_initialized():
+            print("[Vis] play_cached_waveform: Audio init failed")
             return
+
+        print(f"[Vis] play_cached_waveform: Playing waveform with shape {self._latest_waveform.shape}")
 
         waveform = self._latest_waveform
         try:
