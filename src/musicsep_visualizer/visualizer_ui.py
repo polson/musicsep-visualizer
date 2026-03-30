@@ -116,17 +116,17 @@ class Sidebar:
                 self.surface.blit(text_surf, (x_offset, y_offset))
                 y_offset += 20
 
+            y_offset += 12
+            button_h = 34
+            button_rect = pygame.Rect(15, y_offset, self.width_px - 30, button_h)
             if self.show_play_button:
-                y_offset += 12
-                button_h = 34
-                button_rect = pygame.Rect(15, y_offset, self.width_px - 30, button_h)
                 pygame.draw.rect(self.surface, (50, 88, 120), button_rect, border_radius=6)
                 pygame.draw.rect(self.surface, (98, 148, 194), button_rect, width=1, border_radius=6)
                 button_label = self.font.render("Play Waveform", True, (240, 245, 250))
                 label_rect = button_label.get_rect(center=button_rect.center)
                 self.surface.blit(button_label, label_rect)
                 self.play_button_rect = button_rect
-                y_offset += button_h
+            y_offset += button_h
 
             # Draw Hook List
             y_offset += 20

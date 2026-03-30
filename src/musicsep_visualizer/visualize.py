@@ -53,6 +53,8 @@ class Config:
     # Safe texture limit for most modern GPUs.
     # Tensors larger than this will be downsampled.
     MAX_TEXTURE_DIM = 8192
+    MAX_PREVIEW_ELEMENTS = 1_048_576
+    MAX_PREVIEW_CHANNELS = 64
     # Set to True to see operational logs (setup, discovery, stats)
     DEBUG_MODE = False
 
@@ -109,8 +111,18 @@ class SharedRingBuffer:
         ).share_memory_()
 
         self.meta_buffer = ctx.Array('i', Config.RING_SIZE * 8)
+        self.name_hash_buffer = ctx.Array('q', Config.RING_SIZE)
+        self.sequence_buffer = ctx.Array('q', Config.RING_SIZE)
         self.write_index = ctx.Value('i', 0)
+        self.write_sequence = ctx.Value('q', 0)
         self.active_name_hash = ctx.Value('q', 0)
+        self.preview_buffer = torch.zeros(
+            (self.MAX_HOOKS, Config.MAX_PREVIEW_ELEMENTS),
+            dtype=torch.float32
+        ).share_memory_()
+        self.preview_meta_buffer = ctx.Array('i', self.MAX_HOOKS * 8)
+        self.preview_hash_buffer = ctx.Array('q', self.MAX_HOOKS)
+        self.preview_sequence_buffer = ctx.Array('q', self.MAX_HOOKS)
 
         # Replace Queue with shared arrays (no semaphores!)
         # Store hook names as bytes in shared memory
@@ -122,8 +134,11 @@ class SharedRingBuffer:
         if hasattr(self, 'buffer'):
             del self.buffer
         self.buffer = None
+        if hasattr(self, 'preview_buffer'):
+            del self.preview_buffer
+        self.preview_buffer = None
 
-    def announce_hook(self, name: str):
+    def announce_hook(self, name: str, name_hash: int):
         """Add a hook name to the shared discovery list (replaces Queue.put)."""
         idx = self.discovery_count.value
         if idx >= self.MAX_HOOKS:
@@ -135,6 +150,7 @@ class SharedRingBuffer:
         for i in range(len(name_bytes)):
             self.discovery_names[start + i] = name_bytes[i:i+1]  # Single byte
         self.discovery_names[start + len(name_bytes)] = b'\x00'  # Null terminate
+        self.preview_hash_buffer[idx] = name_hash
 
         self.discovery_count.value = idx + 1
 
@@ -154,7 +170,80 @@ class SharedRingBuffer:
                 names.append(name_bytes.decode('utf-8'))
         return names
 
+    def _find_preview_slot(self, name_hash: int) -> Optional[int]:
+        count = self.discovery_count.value
+        for idx in range(count):
+            if self.preview_hash_buffer[idx] == name_hash:
+                return idx
+        return None
+
+    def _prepare_preview_tensor(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        preview = tensor.detach()
+
+        if preview.dim() == 4:
+            preview = preview[0]
+
+        if preview.dim() not in (2, 3):
+            return None
+
+        if preview.dim() == 3 and preview.shape[0] > Config.MAX_PREVIEW_CHANNELS:
+            preview = preview[:Config.MAX_PREVIEW_CHANNELS]
+
+        if not torch.is_floating_point(preview):
+            preview = preview.float()
+
+        preview = preview.contiguous()
+        numel = preview.numel()
+        if numel > Config.MAX_PREVIEW_ELEMENTS:
+            if preview.dim() == 2:
+                h, w = preview.shape
+                scale = (Config.MAX_PREVIEW_ELEMENTS / float(h * w)) ** 0.5
+                new_h = max(1, int(h * scale))
+                new_w = max(1, int(w * scale))
+                preview = F.interpolate(
+                    preview.unsqueeze(0).unsqueeze(0),
+                    size=(new_h, new_w),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0).squeeze(0)
+            else:
+                c, h, w = preview.shape
+                scale = (Config.MAX_PREVIEW_ELEMENTS / float(c * h * w)) ** 0.5
+                new_h = max(1, int(h * scale))
+                new_w = max(1, int(w * scale))
+                preview = F.interpolate(
+                    preview.unsqueeze(0),
+                    size=(new_h, new_w),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0)
+
+        return preview.contiguous().cpu()
+
+    def _write_preview(self, tensor: torch.Tensor, name_hash: int):
+        slot_idx = self._find_preview_slot(name_hash)
+        if slot_idx is None:
+            return
+
+        preview = self._prepare_preview_tensor(tensor)
+        if preview is None:
+            return
+
+        flat = preview.flatten()
+        numel = flat.numel()
+        self.preview_buffer[slot_idx, :numel].copy_(flat)
+
+        start_meta = slot_idx * 8
+        for i in range(8):
+            self.preview_meta_buffer[start_meta + i] = 0
+        for i, dim in enumerate(preview.shape[:8]):
+            self.preview_meta_buffer[start_meta + i] = dim
+
+        self.preview_sequence_buffer[slot_idx] += 1
+
     def write(self, tensor: torch.Tensor, name_hash: int):
+        self._write_preview(tensor, name_hash)
+
         target_hash = self.active_name_hash.value
         if name_hash != target_hash:
             return
@@ -184,6 +273,10 @@ class SharedRingBuffer:
         # Ensure GPU copy is complete before publishing the index
         torch.cuda.synchronize()
 
+        next_sequence = self.write_sequence.value + 1
+        self.name_hash_buffer[current_idx] = name_hash
+        self.sequence_buffer[current_idx] = next_sequence
+        self.write_sequence.value = next_sequence
         self.write_index.value = current_idx
 
     def read_latest(self) -> Optional[torch.Tensor]:
@@ -200,6 +293,47 @@ class SharedRingBuffer:
         for s in shape: numel *= s
 
         return self.buffer[idx, :numel].view(*shape)
+
+    def read_latest_with_hash(self) -> tuple[Optional[int], Optional[torch.Tensor]]:
+        idx = self.write_index.value
+        start_meta = idx * 8
+        shape = []
+        for i in range(8):
+            val = self.meta_buffer[start_meta + i]
+            if val == 0:
+                break
+            shape.append(val)
+
+        if not shape:
+            return None, None
+
+        numel = 1
+        for s in shape:
+            numel *= s
+
+        return self.name_hash_buffer[idx], self.buffer[idx, :numel].view(*shape)
+
+    def read_preview(self, name_hash: int) -> Optional[torch.Tensor]:
+        slot_idx = self._find_preview_slot(name_hash)
+        if slot_idx is None or self.preview_sequence_buffer[slot_idx] == 0:
+            return None
+
+        start_meta = slot_idx * 8
+        shape = []
+        for i in range(8):
+            val = self.preview_meta_buffer[start_meta + i]
+            if val == 0:
+                break
+            shape.append(val)
+
+        if not shape:
+            return None
+
+        numel = 1
+        for s in shape:
+            numel *= s
+
+        return self.preview_buffer[slot_idx, :numel].view(*shape).clone()
 
     def set_active_hook(self, name_str: str):
         h = zlib.adler32(name_str.encode('utf-8')) & 0x7FFFFFFF
@@ -280,7 +414,7 @@ class VisualizationHook(torch.nn.Identity):
             if not self._sent_discovery:
                 if Config.DEBUG_MODE:
                     print(f"[Hook] Announcing: {self.name}")
-                VisualizationHook._shared_ring.announce_hook(self.name)
+                VisualizationHook._shared_ring.announce_hook(self.name, self.name_hash)
                 self._sent_discovery = True
 
             # Write attempts
@@ -551,31 +685,45 @@ class TensorVisualizer:
                     # Wrap tensor processing in try-except to prevent crashes
                     # from malformed/unexpected tensor data
                     try:
-                        tensor = self.ring.read_latest()
+                        active_name = self.known_names[self.active_hook_index] if self.known_names else None
+                        active_hash = (
+                            zlib.adler32(active_name.encode('utf-8')) & 0x7FFFFFFF
+                            if active_name is not None else None
+                        )
 
-                        if tensor is not None:
-                            if tensor.dim() == 4: tensor = tensor[0]
+                        tensor = None
+                        if active_hash is not None:
+                            latest_hash, latest_tensor = self.ring.read_latest_with_hash()
+                            if latest_hash == active_hash:
+                                tensor = latest_tensor
+                            if tensor is None:
+                                tensor = self.ring.read_preview(active_hash)
 
-                            waveform_for_playback = self._extract_waveform_for_playback(tensor)
-                            self._waveform_playback.update_from_tensor(waveform_for_playback)
+                        if tensor is not None and tensor.dim() == 4:
+                            tensor = tensor[0]
 
-                            if self._is_waveform_tensor_2d(tensor):
-                                spectrogram = self._waveform_to_spectrogram(tensor)
-                                if spectrogram is None:
-                                    tensor = None
-                                else:
-                                    tensor = spectrogram
+                        waveform_for_playback = (
+                            self._extract_waveform_for_playback(tensor)
+                            if tensor is not None else None
+                        )
+                        self._waveform_playback.update_from_tensor(waveform_for_playback)
 
-                            if tensor is not None and tensor.dim() == 3:
-                                num_channels = tensor.shape[0]
-                                channel_idx_used = self.current_channel % num_channels
-                                tensor = tensor[channel_idx_used]
+                        if tensor is not None and self._is_waveform_tensor_2d(tensor):
+                            spectrogram = self._waveform_to_spectrogram(tensor)
+                            tensor = spectrogram if spectrogram is not None else None
 
-                            if tensor is not None and tensor.dim() == 2:
-                                tensor = self._downsample_tensor(tensor)
-                                self._render_tensor(tensor, sidebar_width)
+                        if tensor is not None and tensor.dim() == 3:
+                            num_channels = tensor.shape[0]
+                            channel_idx_used = self.current_channel % num_channels
+                            tensor = tensor[channel_idx_used]
+
+                        if tensor is not None and tensor.dim() == 2:
+                            if not tensor.is_cuda:
+                                tensor = tensor.cuda(non_blocking=True)
+                            tensor = self._downsample_tensor(tensor)
+                            self._render_tensor(tensor, sidebar_width)
                         else:
-                            self._waveform_playback.update_from_tensor(None)
+                            self.current_shape = None
                     except Exception as e:
                         # Log but don't crash - just skip this frame
                         print(f"[Vis] Frame error (skipping): {e}")
